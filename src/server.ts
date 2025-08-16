@@ -132,18 +132,20 @@ class BitgetMCPServer {
           },
           {
             name: 'placeOrder',
-            description: 'Place a new buy or sell order',
+            description: 'Place a new buy or sell order (automatically detects spot vs futures)',
             inputSchema: {
               type: 'object',
               properties: {
-                symbol: { type: 'string', description: 'Trading pair symbol' },
+                symbol: { type: 'string', description: 'Trading pair symbol (e.g., BTCUSDT for spot, BTCUSDT_UMCBL for futures)' },
                 side: { type: 'string', enum: ['buy', 'sell'], description: 'Order side' },
                 type: { type: 'string', enum: ['market', 'limit'], description: 'Order type' },
-                quantity: { type: 'string', description: 'Order quantity' },
+                quantity: { type: 'string', description: 'Order quantity (in base currency for spot, in contracts for futures)' },
                 price: { type: 'string', description: 'Order price (required for limit orders)' },
                 timeInForce: { type: 'string', enum: ['GTC', 'IOC', 'FOK'], description: 'Time in force' },
                 clientOrderId: { type: 'string', description: 'Client order ID' },
-                reduceOnly: { type: 'boolean', description: 'Reduce only flag for futures' }
+                reduceOnly: { type: 'boolean', description: 'Reduce only flag for futures' },
+                marginMode: { type: 'string', enum: ['crossed', 'isolated'], description: 'Margin mode for futures (default: crossed)' },
+                marginCoin: { type: 'string', description: 'Margin coin for futures (default: USDT)' }
               },
               required: ['symbol', 'side', 'type', 'quantity']
             },
@@ -286,12 +288,18 @@ class BitgetMCPServer {
           // Trading
           case 'placeOrder': {
             const orderParams = PlaceOrderSchema.parse(args);
+            console.error('Received placeOrder request:', JSON.stringify(orderParams, null, 2));
+            
+            // Determine if this is a futures order
+            const isFutures = orderParams.symbol.includes('_UMCBL') || orderParams.symbol.includes('_');
+            console.error(`Order type detected: ${isFutures ? 'futures' : 'spot'}`);
+            
             const order = await this.bitgetClient.placeOrder(orderParams);
             return {
               content: [
                 {
                   type: 'text',
-                  text: `Order placed successfully:\\n${JSON.stringify(order, null, 2)}`,
+                  text: `Order placed successfully (${isFutures ? 'futures' : 'spot'}):\\n${JSON.stringify(order, null, 2)}`,
                 },
               ],
             } as CallToolResult;

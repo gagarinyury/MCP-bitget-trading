@@ -21,7 +21,16 @@ export const GetOrderBookSchema = z.object({
 
 export const GetCandlesSchema = z.object({
   symbol: z.string().describe('Trading pair symbol (BTCUSDT for spot, BTCUSDT_UMCBL for futures)'),
-  interval: z.enum(['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1M', '5M', '15M', '30M', '1H', '4H', '1D']).describe('Candle interval (lowercase for spot, uppercase for futures)'),
+  interval: z.enum([
+    // Minutes (lowercase)
+    '1m', '3m', '5m', '15m', '30m',
+    // Hours (can be lowercase, will be converted)
+    '1h', '4h', '6h', '12h', '1H', '4H', '6H', '12H',
+    // Days/Weeks/Months (can be lowercase, will be converted)
+    '1d', '1w', '1D', '1W', '1M',
+    // UTC variants
+    '6Hutc', '12Hutc', '1Dutc', '3Dutc', '1Wutc', '1Mutc'
+  ]).describe('Candle interval - API will auto-format to correct case'),
   limit: z.number().optional().describe('Number of candles (default: 100)')
 });
 
@@ -34,7 +43,9 @@ export const PlaceOrderSchema = z.object({
   price: z.string().optional().describe('Order price (required for limit orders)'),
   timeInForce: z.enum(['GTC', 'IOC', 'FOK']).optional().describe('Time in force'),
   clientOrderId: z.string().optional().describe('Client order ID'),
-  reduceOnly: z.boolean().optional().describe('Reduce only flag for futures')
+  reduceOnly: z.boolean().optional().describe('Reduce only flag for futures'),
+  marginMode: z.enum(['crossed', 'isolated']).optional().describe('Margin mode for futures (default: crossed)'),
+  marginCoin: z.string().optional().describe('Margin coin for futures (default: USDT)')
 });
 
 export const CancelOrderSchema = z.object({
