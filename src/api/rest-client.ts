@@ -5,15 +5,63 @@
 
 import crypto from 'crypto';
 import fetch from 'node-fetch';
-import { BitgetConfig, APIResponse, Ticker, OrderBook, Candle, Order, Balance, Position, OrderParams, BitgetError } from '../types/bitget.js';
+import { 
+  BitgetConfig, 
+  APIResponse, 
+  Ticker, 
+  OrderBook, 
+  Candle, 
+  Order, 
+  Balance, 
+  Position, 
+  OrderParams, 
+  BitgetError,
+  BitgetAPIError,
+  BitgetNetworkError,
+  BitgetRateLimitError,
+  BitgetAuthenticationError,
+  RetryConfig
+} from '../types/bitget.js';
+import { logger } from '../utils/logger.js';
+import { retryManager, RetryManager } from '../utils/retry.js';
+import { priceCache, tickerCache, orderbookCache, candlesCache, balanceCache, positionsCache } from '../utils/cache.js';
 
 export class BitgetRestClient {
   private config: BitgetConfig;
   private rateLimitRequests: number = 0;
   private rateLimitWindow: number = Date.now();
+  private retryManager: RetryManager;
 
-  constructor(config: BitgetConfig) {
+  constructor(config: BitgetConfig, retryConfig?: Partial<RetryConfig>) {
     this.config = config;
+    this.retryManager = new RetryManager(retryConfig);
+    
+    logger.info('BitgetRestClient initialized', {
+      sandbox: config.sandbox,
+      baseUrl: config.baseUrl
+    });
+  }
+
+  /**
+   * Validate API credentials by making a test request
+   */
+  async validateCredentials(): Promise<boolean> {
+    try {
+      if (!this.config.apiKey || !this.config.secretKey || !this.config.passphrase) {
+        throw new BitgetAuthenticationError('Missing API credentials');
+      }
+
+      // Test with a simple account info request
+      await this.request('GET', '/api/v2/spot/account/assets', {}, true);
+      logger.info('API credentials validated successfully');
+      return true;
+    } catch (error: any) {
+      logger.error('API credentials validation failed', { 
+        error: error.message,
+        errorType: error.constructor.name 
+      });
+      return false;
+    }
   }
   
   /**
@@ -99,7 +147,11 @@ export class BitgetRestClient {
     }
     
     if (this.rateLimitRequests >= 10) {
-      throw new Error('Rate limit exceeded');
+      logger.warn('Rate limit exceeded', { 
+        requests: this.rateLimitRequests,
+        window: this.rateLimitWindow 
+      });
+      throw new BitgetRateLimitError('Rate limit exceeded: 10 requests per second');
     }
     
     this.rateLimitRequests++;
@@ -114,86 +166,121 @@ export class BitgetRestClient {
     params: Record<string, any> = {},
     isPrivate: boolean = false
   ): Promise<APIResponse<T>> {
-    this.checkRateLimit();
+    const requestId = Math.random().toString(36).substring(7);
+    const context = `${method} ${endpoint}`;
 
-    const timestamp = Date.now().toString();
-    let url = `${this.config.baseUrl}${endpoint}`;
-    let body = '';
+    return this.retryManager.execute(async () => {
+      this.checkRateLimit();
 
-    // Build query string for GET requests
-    let queryString = '';
-    if (method === 'GET' && Object.keys(params).length > 0) {
-      const searchParams = new URLSearchParams();
-      Object.entries(params).forEach(([key, value]) => {
-        if (value !== undefined && value !== null) {
-          searchParams.append(key, value.toString());
-        }
-      });
-      queryString = searchParams.toString();
-      url += `?${queryString}`;
-    }
+      const timestamp = Date.now().toString();
+      let url = `${this.config.baseUrl}${endpoint}`;
+      let body = '';
 
-    // Handle body for POST requests
-    if (method === 'POST' && Object.keys(params).length > 0) {
-      body = JSON.stringify(params);
-    }
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    };
-
-    // Add authentication headers for private endpoints
-    if (isPrivate) {
-      // For GET requests, include query params in signature path
-      const signaturePath = method === 'GET' && queryString 
-        ? `${endpoint}?${queryString}`
-        : endpoint;
-      
-      const signature = this.generateSignature(timestamp, method, signaturePath, body);
-      headers['ACCESS-KEY'] = this.config.apiKey;
-      headers['ACCESS-SIGN'] = signature;
-      headers['ACCESS-TIMESTAMP'] = timestamp;
-      headers['ACCESS-PASSPHRASE'] = this.config.passphrase;
-      
-      // Add demo trading header if in sandbox mode
-      if (this.config.sandbox) {
-        headers['paptrading'] = '1';
+      // Build query string for GET requests
+      let queryString = '';
+      if (method === 'GET' && Object.keys(params).length > 0) {
+        const searchParams = new URLSearchParams();
+        Object.entries(params).forEach(([key, value]) => {
+          if (value !== undefined && value !== null) {
+            searchParams.append(key, value.toString());
+          }
+        });
+        queryString = searchParams.toString();
+        url += `?${queryString}`;
       }
-    }
 
-    try {
-      console.error(`Making ${method} request to: ${url}`);
+      // Handle body for POST requests
+      if (method === 'POST' && Object.keys(params).length > 0) {
+        body = JSON.stringify(params);
+      }
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+      // Add authentication headers for private endpoints
       if (isPrivate) {
-        console.error('Headers:', JSON.stringify(headers, null, 2));
-      }
-      if (body) {
-        console.error('Body:', body);
-      }
-
-      const response = await fetch(url, {
-        method,
-        headers,
-        body: method === 'POST' ? body : undefined,
-      });
-
-      const data = await response.json() as APIResponse<T>;
-      
-      console.error(`Response status: ${response.status}`);
-      console.error('Response data:', JSON.stringify(data, null, 2));
-
-      if (data.code !== '00000') {
-        const errorMsg = `Bitget API Error: ${data.code} - ${data.msg}`;
-        console.error(errorMsg);
-        throw new Error(errorMsg);
+        // For GET requests, include query params in signature path
+        const signaturePath = method === 'GET' && queryString 
+          ? `${endpoint}?${queryString}`
+          : endpoint;
+        
+        const signature = this.generateSignature(timestamp, method, signaturePath, body);
+        headers['ACCESS-KEY'] = this.config.apiKey;
+        headers['ACCESS-SIGN'] = signature;
+        headers['ACCESS-TIMESTAMP'] = timestamp;
+        headers['ACCESS-PASSPHRASE'] = this.config.passphrase;
+        
+        // Add demo trading header if in sandbox mode
+        if (this.config.sandbox) {
+          headers['paptrading'] = '1';
+        }
       }
 
-      return data;
-    } catch (error) {
-      console.error('Bitget API request failed:', error);
-      console.error('Request details:', { method, url, isPrivate, body });
-      throw error;
-    }
+      try {
+        logger.debug('Making API request', {
+          requestId,
+          method,
+          url,
+          isPrivate,
+          bodyLength: body.length
+        });
+
+        const response = await fetch(url, {
+          method,
+          headers,
+          body: method === 'POST' ? body : undefined,
+        });
+
+        if (!response.ok) {
+          throw new BitgetNetworkError(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json() as APIResponse<T>;
+        
+        logger.debug('Received API response', {
+          requestId,
+          status: response.status,
+          code: data.code
+        });
+
+        if (data.code !== '00000') {
+          const errorCode = data.code;
+          const errorMessage = data.msg || 'Unknown API error';
+          
+          // Classify errors
+          if (errorCode === '40009') {
+            throw new BitgetAuthenticationError(`Authentication failed: ${errorMessage}`);
+          } else if (errorCode === '40014') {
+            throw new BitgetRateLimitError(`Rate limit exceeded: ${errorMessage}`);
+          } else {
+            throw new BitgetAPIError(errorCode, errorMessage, requestId, endpoint);
+          }
+        }
+
+        return data;
+      } catch (error: any) {
+        logger.error('API request failed', {
+          requestId,
+          method,
+          url,
+          error: error.message,
+          errorType: error.constructor.name
+        });
+
+        // Re-throw custom errors as-is
+        if (error instanceof BitgetAPIError || 
+            error instanceof BitgetNetworkError || 
+            error instanceof BitgetRateLimitError || 
+            error instanceof BitgetAuthenticationError) {
+          throw error;
+        }
+
+        // Wrap other errors as network errors
+        throw new BitgetNetworkError(`Network error: ${error.message}`, error);
+      }
+    }, context);
   }
 
   // ========== PUBLIC MARKET DATA METHODS ==========
@@ -202,12 +289,24 @@ export class BitgetRestClient {
    * Get current price for a symbol
    */
   async getPrice(symbol: string): Promise<string> {
+    const cacheKey = `price:${symbol}`;
+    
+    // Try cache first
+    const cachedPrice = priceCache.get(cacheKey);
+    if (cachedPrice) {
+      return cachedPrice;
+    }
+
+    let price: string = '';
+    
     if (this.isFuturesSymbol(symbol)) {
       // Futures ticker
       const futuresSymbol = symbol.includes('_UMCBL') ? symbol : `${symbol}_UMCBL`;
       const response = await this.request<any>('GET', '/api/mix/v1/market/ticker', { symbol: futuresSymbol });
       if (response.data?.last) {
-        return response.data.last;
+        price = response.data.last;
+      } else {
+        throw new Error(`Price not found for symbol: ${symbol}`);
       }
     } else {
       // Spot ticker - use v1 public API
@@ -215,64 +314,116 @@ export class BitgetRestClient {
       if (response.data && Array.isArray(response.data)) {
         const ticker = response.data.find((t: any) => t.symbol === symbol);
         if (ticker) {
-          return ticker.close;
+          price = ticker.close;
+        } else {
+          throw new Error(`Price not found for symbol: ${symbol}`);
         }
+      } else {
+        throw new Error(`Price not found for symbol: ${symbol}`);
       }
     }
-    throw new Error(`Price not found for symbol: ${symbol}`);
+    
+    // Cache the result
+    priceCache.set(cacheKey, price);
+    return price;
   }
 
   /**
    * Get full ticker information
    */
   async getTicker(symbol: string): Promise<Ticker> {
+    const cacheKey = `ticker:${symbol}`;
+    
+    // Try cache first
+    const cachedTicker = tickerCache.get(cacheKey);
+    if (cachedTicker) {
+      return cachedTicker;
+    }
+
+    let ticker: Ticker = {
+      symbol: '',
+      last: '',
+      bid: '',
+      ask: '',
+      high24h: '',
+      low24h: '',
+      volume24h: '',
+      change24h: '',
+      changePercent24h: '',
+      timestamp: 0
+    };
+    
     if (this.isFuturesSymbol(symbol)) {
       // Futures ticker
       const futuresSymbol = symbol.includes('_UMCBL') ? symbol : `${symbol}_UMCBL`;
       const response = await this.request<any>('GET', '/api/mix/v1/market/ticker', { symbol: futuresSymbol });
       if (response.data) {
-        const ticker = response.data;
-        return {
-          symbol: ticker.symbol,
-          last: ticker.last,
-          bid: ticker.bestBid,
-          ask: ticker.bestAsk,
-          high24h: ticker.high24h,
-          low24h: ticker.low24h,
-          volume24h: ticker.baseVolume,
-          change24h: ((parseFloat(ticker.last) - parseFloat(ticker.openUtc)) / parseFloat(ticker.openUtc) * 100).toFixed(2),
-          changePercent24h: ticker.priceChangePercent,
-          timestamp: parseInt(ticker.timestamp) || Date.now()
+        const tickerData = response.data;
+        ticker = {
+          symbol: tickerData.symbol,
+          last: tickerData.last,
+          bid: tickerData.bestBid,
+          ask: tickerData.bestAsk,
+          high24h: tickerData.high24h,
+          low24h: tickerData.low24h,
+          volume24h: tickerData.baseVolume,
+          change24h: ((parseFloat(tickerData.last) - parseFloat(tickerData.openUtc)) / parseFloat(tickerData.openUtc) * 100).toFixed(2),
+          changePercent24h: tickerData.priceChangePercent,
+          timestamp: parseInt(tickerData.timestamp) || Date.now()
         };
+      } else {
+        throw new Error(`Ticker not found for symbol: ${symbol}`);
       }
     } else {
       // Spot ticker - use v1 public API
       const response = await this.request<any>('GET', '/api/spot/v1/market/tickers', {});
       if (response.data && Array.isArray(response.data)) {
-        const ticker = response.data.find((t: any) => t.symbol === symbol);
-        if (ticker) {
-          return {
-            symbol: ticker.symbol,
-            last: ticker.close,
-            bid: ticker.buyOne,
-            ask: ticker.sellOne,
-            high24h: ticker.high24h,
-            low24h: ticker.low24h,
-            volume24h: ticker.baseVol,
-            change24h: ticker.change,
-            changePercent24h: ticker.changePercent,
-            timestamp: parseInt(ticker.ts) || Date.now()
+        const tickerData = response.data.find((t: any) => t.symbol === symbol);
+        if (tickerData) {
+          ticker = {
+            symbol: tickerData.symbol,
+            last: tickerData.close,
+            bid: tickerData.buyOne,
+            ask: tickerData.sellOne,
+            high24h: tickerData.high24h,
+            low24h: tickerData.low24h,
+            volume24h: tickerData.baseVol,
+            change24h: tickerData.change,
+            changePercent24h: tickerData.changePercent,
+            timestamp: parseInt(tickerData.ts) || Date.now()
           };
+        } else {
+          throw new Error(`Ticker not found for symbol: ${symbol}`);
         }
+      } else {
+        throw new Error(`Ticker not found for symbol: ${symbol}`);
       }
     }
-    throw new Error(`Ticker not found for symbol: ${symbol}`);
+    
+    // Cache the result
+    tickerCache.set(cacheKey, ticker);
+    return ticker;
   }
 
   /**
    * Get order book
    */
   async getOrderBook(symbol: string, depth: number = 20): Promise<OrderBook> {
+    const cacheKey = `orderbook:${symbol}:${depth}`;
+    
+    // Try cache first
+    const cachedOrderBook = orderbookCache.get(cacheKey);
+    if (cachedOrderBook) {
+      return cachedOrderBook;
+    }
+
+    let orderBook: OrderBook = {
+      symbol: '',
+      bids: [],
+      asks: [],
+      timestamp: 0
+    };
+    
     if (this.isFuturesSymbol(symbol)) {
       // Futures orderbook
       const futuresSymbol = symbol.includes('_UMCBL') ? symbol : `${symbol}_UMCBL`;
@@ -281,7 +432,7 @@ export class BitgetRestClient {
         limit: depth.toString()
       });
       
-      return {
+      orderBook = {
         symbol: futuresSymbol,
         bids: response.data?.bids || [],
         asks: response.data?.asks || [],
@@ -295,13 +446,17 @@ export class BitgetRestClient {
         limit: depth.toString()
       });
       
-      return {
+      orderBook = {
         symbol,
         bids: response.data?.bids || [],
         asks: response.data?.asks || [],
         timestamp: response.data?.ts || Date.now()
       };
     }
+    
+    // Cache the result
+    orderbookCache.set(cacheKey, orderBook);
+    return orderBook;
   }
 
   /**

@@ -128,3 +128,61 @@ export interface APIResponse<T> {
   requestTime: number;
   data: T;
 }
+
+// Custom Error Classes
+export class BitgetAPIError extends Error {
+  constructor(
+    public code: string,
+    message: string,
+    public requestId?: string,
+    public endpoint?: string
+  ) {
+    super(message);
+    this.name = 'BitgetAPIError';
+  }
+}
+
+export class BitgetNetworkError extends Error {
+  constructor(message: string, public cause?: Error) {
+    super(message);
+    this.name = 'BitgetNetworkError';
+  }
+}
+
+export class BitgetRateLimitError extends Error {
+  constructor(message: string = 'Rate limit exceeded') {
+    super(message);
+    this.name = 'BitgetRateLimitError';
+  }
+}
+
+export class BitgetAuthenticationError extends Error {
+  constructor(message: string = 'Authentication failed') {
+    super(message);
+    this.name = 'BitgetAuthenticationError';
+  }
+}
+
+export class BitgetValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BitgetValidationError';
+  }
+}
+
+// Retry Configuration
+export interface RetryConfig {
+  maxRetries: number;
+  baseDelay: number;
+  maxDelay: number;
+  backoffMultiplier: number;
+  retryableErrors: string[];
+}
+
+// Logger interface
+export interface Logger {
+  debug(message: string, meta?: any): void;
+  info(message: string, meta?: any): void;
+  warn(message: string, meta?: any): void;
+  error(message: string, meta?: any): void;
+}
